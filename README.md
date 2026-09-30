@@ -15,7 +15,9 @@ A production-ready webhook receiver that securely captures, validates, and store
 
 ```
 fastapi-webhook-receiver/
-├── main.py             # FastAPI application
+├── main.py                      # FastAPI application
+├── scripts/send_test_webhook.py # Signed test sender / quick load test
+├── tests/                       # pytest suite
 ├── requirements.txt
 └── .env.example
 ```
@@ -25,7 +27,7 @@ fastapi-webhook-receiver/
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env (Supabase credentials optional)
+# Set WEBHOOK_SECRET and LOGS_API_KEY (Supabase optional)
 ```
 
 ## Supabase Table
@@ -35,20 +37,40 @@ If using Supabase, create this table:
 ```sql
 create table webhook_logs (
   event_id     text primary key,
+  delivery_id  text,
   source       text,
   event_type   text,
   payload      jsonb,
   received_at  timestamptz
 );
+create index on webhook_logs (received_at desc);
+create unique index on webhook_logs (delivery_id) where delivery_id is not null;
 ```
 
 ## Running
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 API docs: http://localhost:8000/docs
+
+## How it handles volume
+
+- **Fast acknowledgement** – the request returns `202` as soon as the signature is checked; database writes
+  happen in a background worker, so a slow database never slows senders down.
+- **Batched writes** – events are written to Supabase in batches (`BATCH_SIZE` / `BATCH_INTERVAL`) with retries.
+- **Back-pressure** – when the queue (`QUEUE_SIZE`) is full the API answers `503` + `Retry-After`,
+  so well-behaved senders retry instead of events being silently lost.
+- **Idempotency** – `X-Delivery-Id` / `X-GitHub-Delivery` duplicates are acknowledged but stored once.
+- **Graceful shutdown** – queued events are flushed before the process exits.
+
+## Security
+
+- Signature is **required**: `X-Hub-Signature-256` (or `X-Signature`) = `sha256=HMAC_SHA256(secret, raw body)`.
+  Without `WEBHOOK_SECRET` every request is refused unless `ALLOW_UNSIGNED=true` (local testing only).
+- Constant-time comparison, body size limit (`MAX_BODY_BYTES`, `413` above it).
+- `/logs` and `/metrics` require `X-API-Key: <LOGS_API_KEY>` — payloads are never public.
 
 ## Endpoints
 
@@ -57,15 +79,16 @@ API docs: http://localhost:8000/docs
 {
   "status": "ok",
   "timestamp": "2024-05-15T10:00:00+00:00",
-  "supabase_connected": true
+  "supabase_connected": true,
+  "queue_depth": 0
 }
 ```
 
 ### `POST /webhook`
 Headers:
-- `X-Hub-Signature-256: sha256=<hmac>` (optional, required if `WEBHOOK_SECRET` set)
-- `X-Event-Source: github`
-- `X-Event-Type: push`
+- `X-Hub-Signature-256: sha256=<hmac>` (required)
+- `X-Event-Source: shop` / `X-Event-Type: order.created` (optional; GitHub's `X-GitHub-Event` is recognised)
+- `X-Delivery-Id: <unique id>` (optional, enables de-duplication)
 
 Response `202 Accepted`:
 ```json
@@ -75,20 +98,46 @@ Response `202 Accepted`:
 }
 ```
 
-### `GET /logs?limit=20`
+| Status | Meaning |
+|---|---|
+| `202` | Accepted |
+| `200` | Duplicate delivery, already stored |
+| `401` | Bad signature |
+| `413` | Body too large |
+| `503` | Queue full (retry) or receiver not configured |
+
+### `GET /logs?limit=20&source=github&event_type=push` (X-API-Key)
 ```json
 {
-  "count": 2,
+  "count": 1,
   "logs": [
     {
       "event_id": "...",
+      "delivery_id": "...",
       "source": "github",
       "event_type": "push",
-      "payload": {...},
+      "payload": {"...": "..."},
       "received_at": "2024-05-15T10:00:00+00:00"
     }
   ]
 }
+```
+
+### `GET /metrics` (X-API-Key)
+Counters since start-up: `received`, `duplicates`, `rejected`, `persisted`, `persist_errors`, `queue_depth`.
+
+## Sending test webhooks
+
+```bash
+python scripts/send_test_webhook.py                     # one signed event
+python scripts/send_test_webhook.py --count 2000 -c 50  # quick load test
+```
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
 ## Tech Stack
